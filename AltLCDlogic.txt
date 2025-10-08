@@ -1,0 +1,12 @@
+def set_wheel_goals(marker_quadrant):
+    if marker_quadrant == "NE":
+        left, right = 0, 0
+    elif marker_quadrant == "NW":
+        left, right = 0, 1
+    elif marker_quadrant == "SW":
+        left, right = 1, 1
+    elif marker_quadrant == "SE":
+        left, right = 1, 0
+    else:
+        left, right = None, None  # Unknown quadrant
+    return left, right
