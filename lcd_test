@@ -1,0 +1,38 @@
+import time
+import board
+import adafruit_character_lcd.character_lcd_rgb_i2c as character_lcd
+import queue
+import threading
+from random import random
+from time import sleep
+
+q = queue.Queue()
+
+def lcd():
+
+    lcd_columns = 16
+    lcd_rows = 2
+
+    # Initialise I2C bus.
+    board_i2c = board.I2C()
+
+    # Initialise the LCD class
+    lcd = character_lcd.Character_LCD_RGB_I2C(board_i2c, lcd_columns, lcd_rows)
+
+    lcd.clear()
+    lcd.color = [100, 0, 0]
+
+    while True:
+        if not q.empty():
+            newMessage = q.get()
+            lcd.message = newMessage
+
+lcdThread = threading.Thread(target=lcd,args=())
+lcdThread.start()
+
+while True:
+    putSomething = str(random())
+    if True:
+        q.put(putSomething)
+
+    sleep(1)
