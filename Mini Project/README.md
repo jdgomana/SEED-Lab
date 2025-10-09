@@ -10,14 +10,12 @@ Pi Pin 3 <-> Arduino Pin A5
 Pi Pin 6 <-> Arduino GND
 
 <p>
-  <img width="516" height="296" alt="image" src="https://github.com/user-attachments/assets/ddda6e54-318a-4374-bb52-cce38aea2884" />  
+  <img width="250" height="150" alt="image" src="https://github.com/user-attachments/assets/ddda6e54-318a-4374-bb52-cce38aea2884" />  
 </p>
 <p>
-  <img width="363" height="341" alt="image" src="https://github.com/user-attachments/assets/141fa792-8f9b-47ec-8e89-9b35b89c494f" />
+  <img width="175" height="175" alt="image" src="https://github.com/user-attachments/assets/141fa792-8f9b-47ec-8e89-9b35b89c494f" />
 </p>
 
-Instructions:  
-1. 
 
 
 
