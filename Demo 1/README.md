@@ -7,4 +7,4 @@ The objective of Demo 1 is to accomplish three main tasks:
 Setup:
 No connections are needed between the Pi and Arduino.
 
-<img width="1094" height="871" alt="image" src="https://github.com/user-attachments/assets/bfad7ef6-c81a-4c17-bbaa-1c792fc2cd98" />
+<img width="365" height="290" alt="image" src="https://github.com/user-attachments/assets/bfad7ef6-c81a-4c17-bbaa-1c792fc2cd98" />
