@@ -1,0 +1,18 @@
+I had to build a new state machine that transferred the robot from arming to turning to moving forward
+and then aligning each of these states having new complexities. I also had to add functionality using to
+the wheel angle (theta[i]) and turn it into equations for forward distance and angle turned at the end
+these values were multiplied by a straight factor to match my real world measured distances. This
+concept later will help me fine tune speed VS accuracy for further demos.
+
+I have two new controllers for turning (kx_phi_turn) and (kx_phi_foward) to help separate and micro
+manage both movement patterns separately.
+
+The speed of the robot now based on now much distance left in the forward movement. And computes
+if it can stop with (v_stop)
+
+Align phase is final check for how much distance traveled and helps us get ready for next set of
+commands
+
+Each wheel has adjustable wgain and voltage cut offs to fine tune wheel differences (our wheel control
+however is very similar.)
+Instead of driving each wheel separately the body moves together with vl and vR.
