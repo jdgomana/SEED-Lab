@@ -59,6 +59,7 @@ def calculateAngle():
 def state0():
     if markerXPos != None:
         angle = calculateAngle()
+        # Move to next state when angle is close to 0 degrees
         if abs(angle) <= ANGLE_TOLERANCE:
             writeI2C(0, "LOCALIZE_END")
             return state1
@@ -70,12 +71,14 @@ def state0():
 # CALCULATING_DISTANCE state
 # Robot moves forward until the distance between the camera and marker is 1.5 ft
 def state1():
-    # Width calculations
+    # Calculate pixel width of marker in frame
     bottomLeft = markerCorners[2]
     bottomRight = markerCorners[3]
     pixelWidth = np.linalg.norm(bottomRight - bottomLeft)
+    # Distance = 1ft * (pixel width @ 1ft / pixel width now)
     distance = round(1 * (DISTANCE_CALIBRATION / pixelWidth), 2)
     print("Feet: " + str(distance))
+    # Move to next state when distance is within 1.5ft
     if distance <= TARGET_DISTANCE:
         writeI2C(0, "FORWARD_END")
         return state2
@@ -86,6 +89,7 @@ def state1():
 # Robot rotates to fine-tune its angle to the marker. The tolerance is lowered to 0.25 degrees
 def state2():
     angle = calculateAngle()
+    # End FSM when angle is close to 0 degrees
     if abs(angle) <= ALIGN_TOLERANCE:
         writeI2C(0, "ALIGN_END")
         return None
