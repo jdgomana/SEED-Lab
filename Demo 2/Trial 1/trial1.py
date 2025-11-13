@@ -54,7 +54,7 @@ def calculateAngle():
 
 
 # CALCULATING_ANGLE state
-# Robot rotates until the camera angle is close to zero (Aruco marker is perpendicular to the robot),
+# Robot rotates until it detects the Aruco marker and the angle is close to zero (Aruco marker is perpendicular to the robot),
 # with a tolerance of 0.5 degrees
 def state0():
     if markerXPos != None:
