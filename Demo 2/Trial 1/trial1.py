@@ -6,6 +6,8 @@ from cv2 import aruco
 
 # I2C address of the Arduino, set in Arduino sketch
 ARD_ADDR = 8
+
+# Angle and distance constants
 ANGLE_TOLERANCE = 0.5
 ALIGN_TOLERANCE = 0.25
 DISTANCE_CALIBRATION = 111
