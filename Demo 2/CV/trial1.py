@@ -1,3 +1,6 @@
+# This program uses distance and angle calculations to send movement commands to the Arduino.
+# The FSM proceeds as follows: calculates angle to ArUco marker until close to 0 -> calculates distance to marker until 1.5ft -> calculates angle again until closer to zero -> end
+
 from smbus2 import SMBus
 from time import sleep
 import numpy as np
