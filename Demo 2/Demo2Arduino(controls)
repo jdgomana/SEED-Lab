@@ -24,8 +24,8 @@ const float R_wheel = 0.0762f;          // [m]
 const float L_axle  = 0.3505f;          // [m]
 
 /* ---------- Odometry calibration ---------- */
-float DIST_K = 1.93f;                   // straight-line scale
-const float YAW_K  = 1.78f;             // yaw scale
+float DIST_K = 1.91f;                   // straight-line scale 1.93
+const float YAW_K  = 1.86f;             // yaw scale 1.78
 
 /* ================= Loop timing =========================== */
 const unsigned long Ts_ms = 10;         // 100 Hz
@@ -104,7 +104,7 @@ const float A_BRAKE = 1.10f;
 /* ================= Mission inputs ======================= */
 float missionAngleDeg = 0.0f;   // from camera (marker angle)
 float missionDistM    = 0.0f;   // from camera (distance - 1.5 ft)
-char  missionArrow    = 'N';    // 'L','R','N'
+char  missionArrow    = 'N';    // 'L','R','N' (will be latched AFTER forward move)
 
 float phi_des         = 0.0f;   // heading target
 float p_des           = 0.0f;   // distance target
@@ -133,7 +133,7 @@ const float SEARCH_STEP_DEG   = 90.0f;
 const float SEARCH_W          = 0.35f;      // [rad/s]
 const float SEARCH_TOL_DEG    = 2.0f;       // finish spurt tolerance
 // Shorter pause between spurts (kept)
-const unsigned long SEARCH_IDLE_MS = 200UL; // pause between spurts
+const unsigned long SEARCH_IDLE_MS = 120UL; // pause between spurts
 
 bool  searchActive      = false;
 float searchTargetPhi   = 0.0f;
@@ -145,7 +145,7 @@ char  lastArrowDir = 'L';  // default: left (positive rotation)
 /* ================= DONE → back to search ================= */
 unsigned long doneStartMs = 0;
 // Shorter wait before resuming search (kept)
-const unsigned long DONE_WAIT_MS = 2000UL;
+const unsigned long DONE_WAIT_MS = 6000UL;
 
 /* ================= Camera / I2C globals ================= */
 /*
@@ -339,7 +339,9 @@ void loop(){
       float moveFt = camDistanceFt_cmd - 1.5f;   // distance - 1.5 ft
       if (moveFt < 0.0f) moveFt = 0.0f;
       missionDistM = ft2m(moveFt);
-      missionArrow = camArrow_cmd;   // already sanitized to L/R/N
+
+      // *** DO NOT latch arrow yet – wait until after forward move ***
+      missionArrow = 'N';
 
       phi_des = wrapPi(phi_r + missionAngleDeg * (PI/180.0f));
       p_des   = p_m  + missionDistM;
@@ -356,8 +358,7 @@ void loop(){
       Serial.print(missionAngleDeg);
       Serial.print(F("  dist_m="));
       Serial.print(missionDistM);
-      Serial.print(F("  arrow="));
-      Serial.println(missionArrow);
+      Serial.println(F("  (arrow will be latched after DRIVE_MARKER)"));
     }
     else {
       // No G yet → perform 90° search spurts
@@ -452,6 +453,12 @@ void loop(){
       w_cmd  = 0.0f;
       ephi_int_turn = 0.0f;
       ep_int        = 0.0f;
+
+      // *** LATCH ARROW HERE – AFTER FORWARD MOTION ***
+      missionArrow = camArrow_cmd;  // use latest, already-sanitized value
+
+      Serial.print(F("[DRIVE_MARKER] done, latched missionArrow = "));
+      Serial.println(missionArrow);
 
       if (missionArrow == 'L' || missionArrow == 'R'){
         phase = ARROW_TURN;
@@ -571,7 +578,9 @@ void loop(){
     Serial.print(camAngleDeg_cmd);
     Serial.print(F("  Dft="));
     Serial.print(camDistanceFt_cmd);
-    Serial.print(F("  arrow="));
-    Serial.println(camArrow_cmd);
+    Serial.print(F("  camArrow="));
+    Serial.print(camArrow_cmd);
+    Serial.print(F("  missionArrow="));
+    Serial.println(missionArrow);
   }
 }
