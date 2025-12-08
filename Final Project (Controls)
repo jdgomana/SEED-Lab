@@ -1,0 +1,704 @@
+#include <Wire.h>
+#include <math.h>
+
+/* ===================== Pins / Wiring ===================== */
+#define MY_ADDR 8
+const int EN       = 4;          // motor driver enable
+
+const int MDIR[2]  = {8, 7};     // {LEFT, RIGHT} DIR pins  (swapped)
+const int MPWM[2]  = {10, 9};    // {LEFT, RIGHT} PWM pins  (swapped)
+
+const int ENC_A[2] = {2, 3};     // A channels (INT0, INT1)
+const int ENC_B[2] = {5, 6};     // B channels
+const int LED_PIN  = LED_BUILTIN;
+
+/* ================= Geometry / scaling ==================== */
+long  CPR[2]       = {3200, 3200};
+float radPerCnt[2] = {0, 0};     // [rad/count]
+
+// signs so forward motion gives +counts
+volatile int ENC_SIGN[2]  = {+1, -1};   // fix encoder polarity
+int MOTOR_SIGN[2]         = {-1, +1};   // fix motor polarity
+
+const float R_wheel = 0.0762f;          // [m]
+const float L_axle  = 0.3505f;          // [m]
+
+/* ---------- Odometry calibration ---------- */
+float DIST_K = 1.91f;                   // straight-line scale
+const float YAW_K  = 1.86f;             // yaw scale
+
+/* ================= Loop timing =========================== */
+const unsigned long Ts_ms = 10;         // 100 Hz
+const float Ts_s = Ts_ms / 1000.0f;
+
+/* ========== Inner (velocity) PI ========================= */
+float Kp[2]    = {12.0f, 12.0f};
+float Ki[2]    = {0.0f,  0.0f};
+float integVel[2] = {0, 0};
+
+/* ====== Forward distance PI (robot-level) =============== */
+float Kp_p_o   = 1.0f;
+float Ki_p_o   = 0.10f;
+float ep_int   = 0.0f;
+
+/* ================= Electrical limits ===================== */
+const float VBATT = 7.5f;
+const float VMAX  = VBATT;
+const float U_DEADBAND = 0.05f;
+
+/* ===== Wheel run params / matching ======================= */
+float WGAIN[2]      = {1.0f, 1.0f};
+float U_MIN_RUN[2]  = {0.62f, 0.62f};
+float U_BIAS[2]     = {+0.02f, 0.00f};
+
+/* ===== Anti-chatter / slew ============================== */
+float u_cmd[2]  = {0,0};
+const float DU_MAX    = 0.25f;
+const float SPEED_EPS = 0.15f;
+
+/* ================= Encoder state ======================== */
+volatile long cnt[2]    = {0, 0};
+static   long cnt_prev[2] = {0, 0};
+float theta[2]          = {0, 0};
+float omega_f[2]        = {0, 0};
+
+const float fc_hz = 20.0f;
+const float a_lp  = expf(-(2.0f * PI) * fc_hz * Ts_s);
+
+/* ===== Desired wheel speeds [rad/s] ===================== */
+float desired_speed[2] = {0, 0};
+
+/* ===== Robot pose ======================================= */
+float p_m  = 0.0f;     // distance traveled [m]
+float phi_r = 0.0f;    // heading [rad]
+
+/* ===== Heading control gains ============================ */
+float Kp_phi_turn = 1.15f;
+float Ki_phi_turn = 0.22f;
+float Kd_phi_turn = 2.00f;
+float ephi_int_turn = 0.0f;
+
+float Kp_phi_fwd  = 0.90f;
+float Ki_phi_fwd  = 0.00f;
+float Kd_phi_fwd  = 1.80f;
+float ephi_int_fwd = 0.0f;
+
+const float EPHI_INT_MAX = 0.4f;
+
+/* ===== Body-level command limits ======================== */
+float vp_cmd = 0.0f;            // forward speed [m/s]
+float w_cmd  = 0.0f;            // yaw rate [rad/s]
+
+const float VP_MAX      = 0.65f;
+const float W_MAX_TURN  = 0.55f;
+const float W_MAX_FWD   = 0.40f;
+
+/* ===== Quiet windows ==================================== */
+const float W_QUIET  = 0.015f;
+const float VP_QUIET = 0.02f;
+
+/* ===== Motion profile =================================== */
+const float A_BRAKE = 1.10f;
+
+/* ===== Arrow turn calibration =========================== */
+// Use this instead of hard 90° to correct under/overshoot
+const float ARROW_TURN_DEG = 105.0f;   // tune this (e.g. 100–110)
+
+/* ================= Mission inputs ======================= */
+float missionAngleDeg = 0.0f;   // from camera (first G)
+float missionDistM    = 0.0f;   // from camera (second G, distance - 1.5 ft)
+char  missionArrow    = 'N';    // chosen arrow for TURN ('L','R','N')
+
+// live arrow detected DURING forward motion
+char  liveArrow       = 'N';
+
+float phi_des         = 0.0f;   // heading target
+float p_des           = 0.0f;   // distance target
+float phi_arrow_des   = 0.0f;   // arrow turn target
+bool  arrowTargetSet  = false;
+
+/* ================= Phase machine ======================== */
+enum Phase { SEARCH, ALIGN, FORWARD, TURN, DONE };
+Phase phase = SEARCH;
+
+unsigned long phaseStartMs = 0;
+const unsigned long TURN_TIMEOUT_MS       = 3000UL;
+const unsigned long DRIVE_TIMEOUT_MS      = 4000UL;
+
+/* ===== Strict thresholds ================================ */
+const float PHI_TOL = 0.4f * PI/180.0f;   // ~0.4°
+const float W_TOL   = 0.06f;              // rad/s
+const float P_TOL   = 0.01f;              // ~1 cm
+const float V_TOL   = 0.03f;              // m/s
+
+/* ================= SEARCH (90° spurts) ================== */
+const float SEARCH_STEP_DEG   = 90.0f;
+const float SEARCH_W          = 0.70f;      // [rad/s] faster search
+const float SEARCH_TOL_DEG    = 2.0f;       // spurt stop tolerance
+const unsigned long SEARCH_IDLE_MS = 250UL; // 0.25 s pause
+
+bool  searchActive      = false;
+float searchTargetPhi   = 0.0f;
+unsigned long searchIdleStart = 0;
+
+// remembers which direction to spin search in next time
+char  lastArrowDir = 'L';  // default: left (positive rotation)
+
+// Use spin-search only until we’ve successfully run the first course
+bool spinSearchEnabled = true;
+
+/* ================= DONE ================================ */
+unsigned long doneStartMs = 0;
+const unsigned long DONE_WAIT_MS = 500UL; // not really used
+
+/* ================= Camera / I2C globals ================= */
+/*
+   Pi sends strings like:
+   - "SA0.0D0.0N"
+   - "GA2.8D3.0R"
+*/
+
+char  camStatus        = 'S';  // 'S' or 'G'
+float camAngleDeg_cmd  = 0.0f;
+float camDistanceFt_cmd= 0.0f;
+char  camArrow_cmd     = 'N';
+
+volatile bool camNewMsg = false;
+char  camBuf[32];
+
+/* Forward target latch flag: second G after ALIGN */
+bool forwardTargetLatched = false;
+
+/* ================= Helpers ============================== */
+static inline float ft2m(float ft){ return ft * 0.3048f; }
+
+static inline float wrapPi(float a){
+  while(a >  PI) a -= 2.0f*PI;
+  while(a < -PI) a += 2.0f*PI;
+  return a;
+}
+
+static inline int V2PWM(float u){
+  int p = (int)((fabs(u)/VBATT)*255.0f + 0.5f);
+  if (p < 0)   p = 0;
+  if (p > 255) p = 255;
+  return p;
+}
+
+static inline void driveSigned(int i, float u){
+  float u_eff = MOTOR_SIGN[i] * u;
+  digitalWrite(MDIR[i], (u_eff >= 0.0f) ? HIGH : LOW);
+  if (fabs(u_eff) < U_DEADBAND) analogWrite(MPWM[i], 0);
+  else                          analogWrite(MPWM[i], V2PWM(u_eff));
+}
+
+static inline void resetWheelPI(){
+  for (int i = 0; i < 2; i++){
+    integVel[i] = 0.0f;
+    u_cmd[i]    = 0.0f;
+    driveSigned(i, 0.0f);
+  }
+}
+
+/* =============== Encoder ISRs =========================== */
+void ISR_leftA(){
+  int A = digitalRead(ENC_A[0]);
+  int B = digitalRead(ENC_B[0]);
+  cnt[0] += ENC_SIGN[0] * ((A != B) ? +1 : -1);
+}
+void ISR_rightA(){
+  int A = digitalRead(ENC_A[1]);
+  int B = digitalRead(ENC_B[1]);
+  cnt[1] += ENC_SIGN[1] * ((A != B) ? +1 : -1);
+}
+
+/* =============== I2C receive: parse SA... / GA... ======= */
+void onRx(int howMany){
+  // If we're TURNING, ignore all incoming data (just flush the buffer)
+  if (phase == TURN){
+    while (Wire.available()) { (void)Wire.read(); }
+    camBuf[0] = '\0';
+    camNewMsg = false;
+    return;
+  }
+
+  if (howMany <= 1) { 
+    // only the offset, nothing useful
+    (void)Wire.read();
+    camBuf[0] = '\0'; 
+    return; 
+  }
+
+  // discard offset byte from write_i2c_block_data
+  (void)Wire.read();
+
+  int i = 0;
+  while (Wire.available() && i < (int)sizeof(camBuf) - 1) {
+    camBuf[i++] = (char)Wire.read();
+  }
+  camBuf[i] = '\0';
+
+  size_t len = strlen(camBuf);
+  if (len < 5) return;
+
+  char status = camBuf[0];
+
+  // find last non-space char as arrow
+  int idx = (int)len - 1;
+  while (idx >= 0 && (camBuf[idx] == '\n' || camBuf[idx] == '\r' || camBuf[idx] == ' ')){
+    idx--;
+  }
+  char arrow = 'N';
+  if (idx >= 0){
+    char c = camBuf[idx];
+    if (c == 'L' || c == 'R') arrow = c;
+    else arrow = 'N';
+  }
+
+  char *pA = strchr(camBuf, 'A');
+  char *pD = strchr(camBuf, 'D');
+  if (!pA || !pD || pD <= pA) return;
+
+  char angleStr[16];
+  int angleLen = pD - (pA + 1);
+  if (angleLen <= 0 || angleLen >= (int)sizeof(angleStr)) return;
+  strncpy(angleStr, pA + 1, angleLen);
+  angleStr[angleLen] = '\0';
+
+  char distStr[16];
+  char *pDistStart = pD + 1;
+  int distLen = idx - (int)(pDistStart - camBuf);
+  if (distLen <= 0 || distLen >= (int)sizeof(distStr)) return;
+  strncpy(distStr, pDistStart, distLen);
+  distStr[distLen] = '\0';
+
+  float a = atof(angleStr);
+  float d = atof(distStr);
+
+  camStatus         = status;
+  camAngleDeg_cmd   = a;
+  camDistanceFt_cmd = d;
+  camArrow_cmd      = arrow;
+  camNewMsg         = true;
+}
+
+/* ================= Setup ================================ */
+void setup(){
+  pinMode(EN, OUTPUT); digitalWrite(EN, HIGH);
+  for (int i=0;i<2;i++){
+    pinMode(MDIR[i], OUTPUT);
+    pinMode(MPWM[i], OUTPUT);
+    pinMode(ENC_A[i], INPUT_PULLUP);
+    pinMode(ENC_B[i], INPUT_PULLUP);
+  }
+  pinMode(LED_PIN, OUTPUT);
+
+  attachInterrupt(digitalPinToInterrupt(ENC_A[0]), ISR_leftA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_A[1]), ISR_rightA, CHANGE);
+
+  for(int i=0;i<2;i++)
+    radPerCnt[i] = (2.0f * PI) / (float)CPR[i];
+
+  Wire.begin(MY_ADDR);
+  Wire.onReceive(onRx);
+
+  Serial.begin(115200);
+  Serial.println(F("# Robot ready: SEARCH phase, waiting for Pi"));
+
+  phase = SEARCH;
+  phaseStartMs = millis();
+}
+
+/* ================= Main loop =========================== */
+void loop(){
+  static unsigned long tLast = millis();
+  unsigned long now = millis();
+  if (now - tLast < Ts_ms) return;
+  tLast = now;
+
+  /* ---------- 1) Read encoders / update odometry -------- */
+  long c[2]; noInterrupts(); c[0]=cnt[0]; c[1]=cnt[1]; interrupts();
+  long dC[2] = { c[0] - cnt_prev[0], c[1] - cnt_prev[1] };
+  cnt_prev[0] = c[0]; cnt_prev[1] = c[1];
+
+  float dtheta[2];
+  for (int i=0;i<2;i++){
+    dtheta[i]  = dC[i] * radPerCnt[i];
+    theta[i]  += dtheta[i];
+    float omega = dtheta[i] / Ts_s;
+    omega_f[i] = a_lp * omega_f[i] + (1.0f - a_lp) * omega;
+  }
+
+  float dp   = DIST_K * (0.5f * R_wheel * (dtheta[0] + dtheta[1]));
+  float dphi = YAW_K  * ((R_wheel / L_axle) * (dtheta[1] - dtheta[0]));
+
+  p_m  += dp;
+  phi_r = wrapPi(phi_r + dphi);
+
+  // measured body rates
+  float phi_dot_meas = YAW_K  * ((R_wheel / L_axle) * (omega_f[1] - omega_f[0]));
+  float rho_dot_meas = DIST_K * (0.5f * R_wheel * (omega_f[0] + omega_f[1]));
+
+  vp_cmd = 0.0f;
+  w_cmd  = 0.0f;
+
+  /* =============== 2) Phase machine ===================== */
+
+  /* -------- SEARCH: first G → ALIGN --------------------- */
+  if (phase == SEARCH){
+    bool newMsg;
+    char statusSnapshot;
+    float angleSnapshot;
+
+    noInterrupts();
+    newMsg         = camNewMsg;
+    statusSnapshot = camStatus;
+    angleSnapshot  = camAngleDeg_cmd;
+    camNewMsg      = false;   // consume this message
+    interrupts();
+
+    if (newMsg && statusSnapshot == 'G'){
+      // Latch first G's angle for ALIGN
+      missionAngleDeg = angleSnapshot;
+      phi_des = wrapPi(phi_r + missionAngleDeg * (PI/180.0f));
+
+      // Reset integrators
+      ephi_int_turn = 0.0f;
+      ep_int        = 0.0f;
+      ephi_int_fwd  = 0.0f;
+
+      // Forward target not yet latched (we wait for second G)
+      forwardTargetLatched = false;
+      liveArrow            = 'N';
+      missionArrow         = 'N';
+
+      phase = ALIGN;
+      phaseStartMs = now;
+
+      // reset spurts for next time
+      searchActive     = false;
+      searchIdleStart  = 0;
+
+      Serial.print(F("[PHASE] SEARCH → ALIGN, angleDeg="));
+      Serial.println(missionAngleDeg);
+    }
+
+    // optional spin-search
+    if (phase == SEARCH){
+      if (!spinSearchEnabled){
+        // After we’ve completed one course, just sit and wait for next G
+        vp_cmd = 0.0f;
+        w_cmd  = 0.0f;
+      } else {
+        if (!searchActive){
+          if (searchIdleStart == 0) searchIdleStart = now;
+          if (now - searchIdleStart >= SEARCH_IDLE_MS){
+            searchIdleStart = 0;
+            searchActive = true;
+
+            float dirSign = +1.0f;
+            if (lastArrowDir == 'R') dirSign = -1.0f;
+
+            searchTargetPhi = wrapPi(phi_r + dirSign * SEARCH_STEP_DEG * (PI/180.0f));
+          }
+        }
+
+        if (searchActive){
+          float e   = wrapPi(searchTargetPhi - phi_r);
+          float tol = SEARCH_TOL_DEG * (PI/180.0f);
+          if (fabs(e) > tol){
+            vp_cmd = 0.0f;
+            w_cmd  = (e > 0.0f) ? +SEARCH_W : -SEARCH_W;
+          } else {
+            vp_cmd = 0.0f;
+            w_cmd  = 0.0f;
+            searchActive = false;
+          }
+        } else {
+          vp_cmd = 0.0f;
+          w_cmd  = 0.0f;
+        }
+      }
+    }
+  }
+
+  /* -------- ALIGN: rotate to phi_des -------------------- */
+  else if (phase == ALIGN){
+    float e_phi = wrapPi(phi_des - phi_r);
+
+    ephi_int_turn += e_phi * Ts_s;
+    if (ephi_int_turn >  EPHI_INT_MAX) ephi_int_turn =  EPHI_INT_MAX;
+    if (ephi_int_turn < -EPHI_INT_MAX) ephi_int_turn = -EPHI_INT_MAX;
+
+    w_cmd = Kp_phi_turn*e_phi + Ki_phi_turn*ephi_int_turn - Kd_phi_turn*phi_dot_meas;
+    if (w_cmd >  W_MAX_TURN) w_cmd =  W_MAX_TURN;
+    if (w_cmd < -W_MAX_TURN) w_cmd = -W_MAX_TURN;
+    if (fabs(w_cmd) < W_QUIET) w_cmd = 0.0f;
+
+    vp_cmd = 0.0f;
+
+    bool doneAngle = (fabs(e_phi) < PHI_TOL && fabs(phi_dot_meas) < W_TOL);
+    bool timeout   = (now - phaseStartMs) > TURN_TIMEOUT_MS;
+
+    if (doneAngle || timeout){
+      // Stop motion, reset wheel PI
+      vp_cmd = 0.0f;
+      w_cmd  = 0.0f;
+      resetWheelPI();
+
+      // Now we're aligned. We want a new G (angle ~0) to define distance.
+      phase = FORWARD;
+      phaseStartMs = now;
+      forwardTargetLatched = false;
+
+      // Clear any 'new' flag to focus on fresh G next loop
+      noInterrupts();
+      camNewMsg = false;
+      interrupts();
+
+      // Distance/arrow integrators
+      ep_int       = 0.0f;
+      ephi_int_fwd = 0.0f;
+
+      // Reset arrow tracking
+      liveArrow    = 'N';
+      missionArrow = 'N';
+
+      Serial.println(F("[PHASE] ALIGN → FORWARD (waiting to latch dist; arrow read during motion)"));
+    }
+  }
+
+  /* -------- FORWARD: latch distance, read arrow WHILE moving -------- */
+  else if (phase == FORWARD){
+    // Step 1: if we haven't latched distance yet, wait for a fresh G
+    if (!forwardTargetLatched){
+      bool newMsg;
+      char statusSnapshot;
+      float distFtSnapshot;
+
+      noInterrupts();
+      newMsg         = camNewMsg;
+      statusSnapshot = camStatus;
+      distFtSnapshot = camDistanceFt_cmd;
+      camNewMsg      = false;  // consume
+      interrupts();
+
+      if (newMsg && statusSnapshot == 'G'){
+        // Latch distance from this G (ignore arrow here)
+        float moveFt = distFtSnapshot - 1.5f;   // Distance: (dist - 1.5 ft), clamp >= 0
+        if (moveFt < 0.0f) moveFt = 0.0f;
+        missionDistM = ft2m(moveFt);
+
+        // Forward distance target from current pose
+        p_des = p_m + missionDistM;
+
+        // Reset distance PI
+        ep_int       = 0.0f;
+        ephi_int_fwd = 0.0f;
+
+        forwardTargetLatched = true;
+        liveArrow            = 'N';   // start arrow measurement from scratch
+
+        Serial.print(F("[FORWARD latch] distFt="));
+        Serial.print(distFtSnapshot);
+        Serial.print(F(" missionDistM="));
+        Serial.println(missionDistM);
+      }
+
+      // Until we latch distance, don't move
+      vp_cmd = 0.0f;
+      w_cmd  = 0.0f;
+    }
+    else {
+      // Step 2: we have missionDistM; run forward PI
+      float e_p   = p_des - p_m;
+      float e_phi = wrapPi(phi_des - phi_r);
+
+      // --- Arrow reading WHILE moving ---
+      bool newMsg;
+      char statusSnapshot, arrowSnapshot;
+      noInterrupts();
+      newMsg         = camNewMsg;
+      statusSnapshot = camStatus;
+      arrowSnapshot  = camArrow_cmd;
+      camNewMsg      = false;       // consume latest
+      interrupts();
+
+      if (newMsg && statusSnapshot == 'G'){
+        if (arrowSnapshot == 'L' || arrowSnapshot == 'R'){
+          liveArrow = arrowSnapshot;  // keep last valid arrow seen while moving
+        }
+      }
+      // --- End arrow reading ---
+
+      ep_int += e_p * Ts_s;
+      if (ep_int > 0.40f)  ep_int = 0.40f;
+      if (ep_int < -0.40f) ep_int = -0.40f;
+
+      float vp_raw = Kp_p_o*e_p + Ki_p_o*ep_int;
+
+      float v_stop = sqrtf(fmaxf(0.0f, 2.0f*A_BRAKE*fabsf(e_p)));
+      float vp_lim = fminf(VP_MAX, v_stop);
+      vp_cmd = fmaxf(-vp_lim, fminf(vp_raw, vp_lim));
+
+      float w_raw = Kp_phi_fwd*e_phi - Kd_phi_fwd*phi_dot_meas;
+      if (w_raw >  W_MAX_FWD) w_raw =  W_MAX_FWD;
+      if (w_raw < -W_MAX_FWD) w_raw = -W_MAX_FWD;
+      w_cmd = w_raw;
+
+      if (fabs(vp_cmd) < VP_QUIET) vp_cmd = 0.0f;
+      if (fabs(w_cmd)  < W_QUIET ) w_cmd  = 0.0f;
+
+      bool doneDist = (fabs(e_p) < P_TOL && fabs(rho_dot_meas) < V_TOL);
+      bool timeout  = (now - phaseStartMs) > DRIVE_TIMEOUT_MS;
+
+      if (doneDist || timeout){
+        vp_cmd = 0.0f;
+        w_cmd  = 0.0f;
+        ephi_int_turn = 0.0f;
+        ep_int        = 0.0f;
+        resetWheelPI();
+
+        // Use whichever arrow we saw LAST while moving
+        missionArrow = liveArrow;
+
+        Serial.print(F("[FORWARD end] liveArrow="));
+        Serial.println(missionArrow);
+
+        if (missionArrow == 'L' || missionArrow == 'R'){
+          phase = TURN;
+          phaseStartMs = now;
+          arrowTargetSet = false;
+          Serial.println(F("[PHASE] FORWARD → TURN"));
+        } else {
+          phase = DONE;
+          doneStartMs = now;
+          lastArrowDir = 'N';
+          Serial.println(F("[PHASE] FORWARD → DONE (no arrow detected while moving)"));
+        }
+      }
+    }
+  }
+
+  /* -------- TURN: ±ARROW_TURN_DEG based on missionArrow -------- */
+  else if (phase == TURN){
+    if (!arrowTargetSet){
+      float arrowDeg = 0.0f;
+
+      // Use calibrated arrow turn angle
+      if (missionArrow == 'L') arrowDeg = +ARROW_TURN_DEG;
+      else if (missionArrow == 'R') arrowDeg = -ARROW_TURN_DEG;
+
+      phi_arrow_des = wrapPi(phi_r + arrowDeg * (PI/180.0f));
+      ephi_int_turn = 0.0f;
+      arrowTargetSet = true;
+
+      Serial.print(F("[TURN] missionArrow="));
+      Serial.print(missionArrow);
+      Serial.print(F(" arrowDeg="));
+      Serial.println(arrowDeg);
+    }
+
+    float e_phi = wrapPi(phi_arrow_des - phi_r);
+    ephi_int_turn += e_phi * Ts_s;
+    if (ephi_int_turn >  EPHI_INT_MAX) ephi_int_turn =  EPHI_INT_MAX;
+    if (ephi_int_turn < -EPHI_INT_MAX) ephi_int_turn = -EPHI_INT_MAX;
+
+    w_cmd = Kp_phi_turn*e_phi + Ki_phi_turn*ephi_int_turn - Kd_phi_turn*phi_dot_meas;
+    if (w_cmd >  W_MAX_TURN) w_cmd =  W_MAX_TURN;
+    if (w_cmd < -W_MAX_TURN) w_cmd = -W_MAX_TURN;
+    if (fabs(w_cmd) < W_QUIET) w_cmd = 0.0f;
+
+    vp_cmd = 0.0f;
+
+    bool doneAngle = (fabs(e_phi) < PHI_TOL && fabs(phi_dot_meas) < W_TOL);
+    bool timeout   = (now - phaseStartMs) > TURN_TIMEOUT_MS;
+
+    if (doneAngle || timeout){
+      if (missionArrow == 'L' || missionArrow == 'R')
+        lastArrowDir = missionArrow;
+
+      vp_cmd = 0.0f;
+      w_cmd  = 0.0f;
+      resetWheelPI();
+
+      // After turning, go back to SEARCH for a brand new G.
+      phase = SEARCH;
+      phaseStartMs = now;
+      searchActive    = false;
+      searchIdleStart = 0;
+      spinSearchEnabled = false;   // no more auto spin after first course
+
+      // CLEAR all camera data so we only use G's AFTER the turn
+      noInterrupts();
+      camNewMsg         = false;
+      camStatus         = 'S';
+      camAngleDeg_cmd   = 0.0f;
+      camDistanceFt_cmd = 0.0f;
+      camArrow_cmd      = 'N';
+      liveArrow         = 'N';
+      interrupts();
+
+      Serial.println(F("[PHASE] TURN → SEARCH (cam data cleared; waiting for fresh G)"));
+    }
+  }
+
+  /* -------- DONE: motors off ---------------------------- */
+  else if (phase == DONE){
+    vp_cmd = 0.0f;
+    w_cmd  = 0.0f;
+    resetWheelPI();
+    // stay stopped until reset/power cycle
+  }
+
+  /* =============== 3) Body → wheel setpoints ============ */
+  float vL = vp_cmd - 0.5f * L_axle * w_cmd;
+  float vR = vp_cmd + 0.5f * L_axle * w_cmd;
+
+  desired_speed[0] = (vL / R_wheel) * WGAIN[0];
+  desired_speed[1] = (vR / R_wheel) * WGAIN[1];
+
+  /* =============== 4) Inner velocity PI ================= */
+  for (int i=0;i<2;i++){
+    float e_vel = desired_speed[i] - omega_f[i];
+    float u = Kp[i]*e_vel + Ki[i]*integVel[i] + U_BIAS[i];
+
+    if (fabs(u) < VMAX) integVel[i] += e_vel * Ts_s;
+    if (u >  VMAX) u =  VMAX;
+    if (u < -VMAX) u = -VMAX;
+
+    // one-sided drive unless we really need reverse
+    if (desired_speed[i] > SPEED_EPS && u < 0.0f) u = 0.0f;
+    if (desired_speed[i] < -SPEED_EPS && u > 0.0f) u = 0.0f;
+
+    if (u != 0.0f && fabs(u) < U_MIN_RUN[i])
+      u = (u > 0.0f) ? U_MIN_RUN[i] : -U_MIN_RUN[i];
+
+    float du = u - u_cmd[i];
+    if (du >  DU_MAX) du =  DU_MAX;
+    if (du < -DU_MAX) du = -DU_MAX;
+    u_cmd[i] += du;
+
+    driveSigned(i, u_cmd[i]);
+  }
+
+  /* =============== 5) Telemetry ========================== */
+  static unsigned long lastPrint = 0;
+  if (now - lastPrint >= 200){
+    lastPrint = now;
+    Serial.print(F("[PHASE] "));
+    Serial.print((int)phase);
+    Serial.print(F("  camStatus="));
+    Serial.print(camStatus);
+    Serial.print(F("  A="));
+    Serial.print(camAngleDeg_cmd);
+    Serial.print(F("  Dft="));
+    Serial.print(camDistanceFt_cmd);
+    Serial.print(F("  camArrow="));
+    Serial.print(camArrow_cmd);
+    Serial.print(F("  liveArrow="));
+    Serial.print(liveArrow);
+    Serial.print(F("  missionArrow="));
+    Serial.println(missionArrow);
+  }
+}
