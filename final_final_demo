@@ -1,0 +1,202 @@
+from smbus2 import SMBus
+from time import sleep, time
+import numpy as np
+import cv2
+from cv2 import aruco
+
+# I2C address of the Arduino
+ARD_ADDR = 8
+DISTANCE_CALIBRATION = 111
+
+AREA_THRESH = 25
+TARGET_SCORE = 0.4
+
+# -------- Camera calibration --------
+data = np.load(r'/home/seedlab/Downloads/camera_calibration_data.npz')
+mtx = data['camera_matrix']
+dist = data['dist_coeff']
+fx = mtx[0, 0]
+fy = mtx[1, 1]
+
+# -------- Load arrow template --------
+template = cv2.imread(r'/home/seedlab/Downloads/arrow_template.png', cv2.IMREAD_GRAYSCALE)
+_, templateBin = cv2.threshold(template, 0, 255,
+                               cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+templateContours, _ = cv2.findContours(templateBin, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+arrowContour = max(templateContours, key=cv2.contourArea)
+
+# -------- I2C and ArUco --------
+i2c = SMBus(1)
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_6X6_50)
+
+camera = cv2.VideoCapture(0)
+sleep(0.5)
+
+last_send_time = 0
+send_interval = 0.1
+
+
+def writeI2C(offset, command: str):
+    print("Sending:", command)
+    try:
+        bytes_out = [ord(c) for c in command]
+        i2c.write_i2c_block_data(ARD_ADDR, offset, bytes_out)
+    except IOError:
+        print("Arduino cannot be written to (I2C error).")
+
+
+def calculate_angle(w, fovX_deg, marker_x):
+    center_to_edge = w / 2.0
+    center_to_com = center_to_edge - marker_x
+    angle = (0.5 * fovX_deg) * (center_to_com / center_to_edge)
+    return round(angle, 1)
+
+
+# ---------------- COLOR CONFIRMATION FUNCTION ----------------
+def confirm_arrow_color(ROI, cx, cy):
+
+    if ROI.size == 0:
+        return "N"
+
+    hsv = cv2.cvtColor(ROI, cv2.COLOR_BGR2HSV)
+
+    # GREEN RANGE
+    lower_green = np.array([35, 60, 40])
+    upper_green = np.array([85, 255, 255])
+    mask_green = cv2.inRange(hsv, lower_green, upper_green)
+
+    # RED RANGE (two parts due to wrap)
+    lower_red1 = np.array([0, 70, 50])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 70, 50])
+    upper_red2 = np.array([180, 255, 255])
+    mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask_red = mask_red1 + mask_red2
+
+    # Sample small area around (cx, cy)
+    kernel = 15
+    y1 = max(cy - kernel, 0)
+    y2 = min(cy + kernel, ROI.shape[0])
+    x1 = max(cx - kernel, 0)
+    x2 = min(cx + kernel, ROI.shape[1])
+
+    green_pixels = np.sum(mask_green[y1:y2, x1:x2] > 0)
+    red_pixels = np.sum(mask_red[y1:y2, x1:x2] > 0)
+
+    if green_pixels > red_pixels and green_pixels > 20:
+        return "L"
+    if red_pixels > green_pixels and red_pixels > 20:
+        return "R"
+
+    return "N"
+# -------------------------------------------------------------
+
+
+# ------------------ NEW ARROW DETECTION ----------------------
+def detect_arrow_new(gray_img, image_bgr, markerCorners):
+
+    x1 = int(min(markerCorners[:, 0]))
+    x2 = int(max(markerCorners[:, 0]))
+    y1 = int(min(markerCorners[:, 1]))
+    y2 = int(max(markerCorners[:, 1]))
+
+    xPadding = int((x2 - x1) * 1.5)
+    arrowROI = image_bgr[y1:y2, x1-xPadding:x2+xPadding]
+
+    if arrowROI.size == 0:
+        return 'N'
+
+    _, thresh = cv2.threshold(gray_img, 0, 255,
+                              cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+
+    bestScore = float("inf")
+    bestContour = None
+
+    for contour in contours:
+        if cv2.contourArea(contour) < AREA_THRESH:
+            continue
+
+        score = cv2.matchShapes(arrowContour, contour,
+                                cv2.CONTOURS_MATCH_I1, 0)
+
+        if score < TARGET_SCORE and score < bestScore:
+            bestScore = score
+            bestContour = contour
+
+    if bestContour is None:
+        return "N"
+
+    M = cv2.moments(bestContour)
+    if M["m00"] == 0:
+        return "N"
+
+    # Centroid relative to full image
+    arrowX = int(M["m10"] / M["m00"])
+    arrowY = int(M["m01"] / M["m00"])
+
+    # Convert centroid into ROI coordinates
+    roi_cx = arrowX - (x1 - xPadding)
+    roi_cy = arrowY - y1
+
+    # Confirm using color
+    color_result = confirm_arrow_color(arrowROI, roi_cx, roi_cy)
+    return color_result
+# -------------------------------------------------------------
+
+
+while True:
+    ret, image = camera.read()
+    if not ret:
+        print("Could not capture image from camera!")
+        break
+
+    h, w = image.shape[:2]
+    newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (w, h), 1, (w, h))
+    image = cv2.undistort(image, mtx, dist, None, newcameramtx)
+
+    fovX = 2 * np.degrees(np.arctan(w / (2 * fx)))
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    corners, ids, _ = aruco.detectMarkers(gray, aruco_dict)
+    image = aruco.drawDetectedMarkers(image, corners, borderColor=4)
+
+    angle_deg = 0.0
+    distance_ft = 0.0
+    arrow_char = "N"
+
+    if ids is not None and len(ids) > 0:
+
+        markerCorners = corners[0].reshape((4, 2))
+        markerXPos = float(np.mean(markerCorners[:, 0]))
+
+        angle_deg = calculate_angle(w, fovX, markerXPos)
+
+        bottomLeft = markerCorners[2]
+        bottomRight = markerCorners[3]
+        pixelWidth = np.linalg.norm(bottomRight - bottomLeft)
+        if pixelWidth > 0:
+            distance_ft = round(DISTANCE_CALIBRATION / pixelWidth, 1)
+
+        arrow_char = detect_arrow_new(gray, image, markerCorners)
+
+        msg = f"GA{angle_deg:.1f}D{distance_ft:.1f}{arrow_char}"
+
+    else:
+        msg = "SA0.0D0.0N"
+
+    if time() - last_send_time >= send_interval:
+        writeI2C(0, msg)
+        last_send_time = time()
+
+    cv2.imshow("Image", image)
+
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+camera.release()
+cv2.destroyAllWindows()
