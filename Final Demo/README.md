@@ -6,7 +6,7 @@ The robot autonomously follows a path of markers by detecting a marker, rotating
 
 Setup:
 
-1. Wiring connections:
+1. Wiring connections:  
    LCD Screen <-> Pi  
    Pi Pin 2 <-> Arduino Pin A4  
    Pi Pin 3 <-> Arduino Pin A5  
@@ -14,8 +14,8 @@ Setup:
     
    <p>
       <img width="250" height="150" alt="image" src="https://github.com/user-attachments/assets/ddda6e54-318a-4374-bb52-cce38aea2884" />  
-  </p>
-  <p>
+   </p>
+   <p>
       <img width="175" height="175" alt="image" src="https://github.com/user-attachments/assets/141fa792-8f9b-47ec-8e89-9b35b89c494f" />
-  </p>
+   </p>
 
