@@ -22,5 +22,5 @@ Setup:
 
 3. On the Pi, run final_demo.py. Ensure camera is connected and code is running correctly before continuing. Make sure power is not disconnected after starting the program.
 4. Flash the Arduino with the final demo code. Turn robot off as it will immediately try to turn.
-5. Once robot is positioned, turn it on and press reset button on Arduino to start the maze navigation.
+5. Once robot is positioned, turn it on and press reset button on Arduino to start the maze navigation. The "searching" phase always begins with the robot turning counter-clockwise.
 
